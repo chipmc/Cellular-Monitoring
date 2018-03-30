@@ -12,7 +12,7 @@
     enabling sleep  2) Low Battery Mode - reduced functionality to preserve battery charge
 
     The mode will be set and recoded in the CONTROLREGISTER so resets will not change the mode
-    Control Register - bits 7-4, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Open, 0 - Low Power Mode
+    Control Register - bits 7-4, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Pumping, 0 - Low Power Mode
     We won't use Solar or Low Power modes at this time but will keep control register structure
 */
 
@@ -38,12 +38,12 @@
 #define CURRENTDAILYCOUNT 0xC         // Current Daily Count - 16 bits
 #define CURRENTCOUNTSTIME 0xE         // Time of last count - 32 bits
 #define CURRENTPOINTER 0x12           // Two bytes for hourly pointer
-                                      // Four open bytes here which takes us to the third word
+#define DAILYPUMPMINUTES 0x14         // How Many minutes has the pump run today
 //These are the offsets that make up the respective words (4 bytes time, 2 bytes count, 2 bytes duration)
 #define CURRENTCOUNTOFFSET 4          // Offsets for the values in the hourly words
 #define CURRENTDURATIONOFFSET 6       // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.50"
+#define SOFTWARERELEASENUMBER "0.58"
 
 
 // Included Libraries
@@ -64,7 +64,7 @@ State state = INITIALIZATION_STATE;
 
 // Pin Constants
 const int tmp36Pin =          A0;               // Simple Analog temperature sensor
-const int anyOnDetectPin =    A2;               // Pin for Voltage Sensor interrupt - Brown-White - Not used for now - hardware upgrade needed
+const int anyOnDetectPin =    A2;               // Pin for Voltage Sensor interrupt - Brown-White
 const int pump2CalledPin =    A4;               // Pin for Voltage Sensor interrupt - Brown
 const int wakeUpPin =         A7;               // This is the Particle Electron WKP pin
 const int boosterNoFlow1Pin = B1;               // Pin for Voltage Sensor interrupt - Orange-White
@@ -81,12 +81,12 @@ const int blueLED =           D7;               // This LED is on the Electron i
 // Timing Variables
 unsigned long webhookWait = 45000;              // How long we will wair for a webhook response
 unsigned long resetWait = 30000;                // Honw long we will wait before resetting on an error
-unsigned long publishFrequency = 1000;         // How often can we publish to Particle
+unsigned long publishFrequency = 1000;          // How often can we publish to Particle
 unsigned long sampleFrequency = 2000;           // How often will we take a sample
 unsigned long webhookTimeStamp = 0;
 unsigned long resetTimeStamp = 0;
 unsigned long sampleTimeStamp = 0;
-unsigned long publishTimeStamp = 0;              // Keep track of when we publish a webhook
+unsigned long publishTimeStamp = 0;             // Keep track of when we publish a webhook
 unsigned long lastPublish = 0;
 unsigned long lastSample = 0;
 
@@ -97,10 +97,8 @@ bool ledState = LOW;                                // variable used to store th
 const char* releaseNumber = SOFTWARERELEASENUMBER;  // Displays the release on the menu
 byte controlRegister;                               // Stores the control register values
 int lowBattLimit = 30;                              // Trigger for Low Batt State
-bool solarPowerMode;                                // Changes the PMIC settings
 bool verboseMode;                                   // Enables more active communications for configutation and setup
 retained char Signal[17];                           // Used to communicate Wireless RSSI and Description
-char Status[17] = "";                               // Used to communciate updates on System Status
 const char* levels[6] = {"Poor", "Low", "Medium", "Good", "Very Good", "Great"};
 bool pettingEnabled = true;
 
@@ -109,27 +107,32 @@ time_t t;
 byte lastHour = 0;                          // For recording the startup values
 byte lastDate = 0;                          // These values make sure we record events if time has lapsed
 byte alertValue = 0;                        // Current Active Alerts
+byte lastAlertValue = 0;                    // Last value - so we can detect a
 bool dataInFlight = false;                  // Tracks if we have sent data but not yet cleared it from counts until we get confirmation
 byte currentHourlyPeriod;                   // This is where we will know if the period changed
-byte currentDailyPeriod;                    // We will keep daily counts as well as period counts
 
 // Battery monitor
 int stateOfCharge = 0;                      // stores battery charge level value
 
+// Pump monitoriing
+time_t pumpingStart = 0;
+int dailyPumpingMins = 0;
+
+
 void setup()                                                      // Note: Disconnected Setup()
 {
-  pinMode(boosterNoFlow1Pin,INPUT);                                         // Voltage Sensor Interrupt pin
-  pinMode(boosterNoFlow2Pin,INPUT);                                         // Voltage Sensor Interrupt pin
-  pinMode(storageTankLowPin,INPUT);                                         // Voltage Sensor Interrupt pin
-  pinMode(pump1CalledPin,INPUT);                                         // Voltage Sensor Interrupt pin
-  pinMode(pump2CalledPin,INPUT);                                         // Voltage Sensor Interrupt pin
+  pinMode(boosterNoFlow1Pin,INPUT);                               // Voltage Sensor Interrupt pin
+  pinMode(boosterNoFlow2Pin,INPUT);                               // Voltage Sensor Interrupt pin
+  pinMode(storageTankLowPin,INPUT);                               // Voltage Sensor Interrupt pin
+  pinMode(pump1CalledPin,INPUT);                                  // Voltage Sensor Interrupt pin
+  pinMode(pump2CalledPin,INPUT);                                  // Voltage Sensor Interrupt pin
   pinMode(wakeUpPin,INPUT);                                       // This pin is active HIGH
   pinMode(userSwitch,INPUT);                                      // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                                       // declare the Blue LED Pin as an output
   pinMode(tmp36Shutdwn,OUTPUT);                                   // Supports shutting down the TMP-36 to save juice
   digitalWrite(tmp36Shutdwn, HIGH);                               // Turns on the temp sensor
   pinMode(donePin,OUTPUT);                                        // Allows us to pet the watchdog
-  watchdogISR();                    // Pet the watchdog
+  watchdogISR();                                                  // Pet the watchdog
   pinMode(hardResetPin,OUTPUT);                                   // For a hard reset active HIGH
 
   char responseTopic[125];
@@ -137,12 +140,13 @@ void setup()                                                      // Note: Disco
   deviceID.toCharArray(responseTopic,125);
   Particle.subscribe(responseTopic, UbidotsHandler, MY_DEVICES);      // Subscribe to the integration response event
 
-  Particle.variable("Alerts",alertValue);
+  Particle.variable("Alerts",lastAlertValue);
   Particle.variable("Signal", Signal);
   Particle.variable("ResetCount", resetCount);
   Particle.variable("Temperature",temperatureF);
   Particle.variable("Release",releaseNumber);
   Particle.variable("stateOfChg", stateOfCharge);
+  Particle.variable("pumpMinutes",dailyPumpingMins);
 
   Particle.function("Reset-FRAM", resetFRAM);
   Particle.function("Reset-Counts",resetCounts);
@@ -152,12 +156,10 @@ void setup()                                                      // Note: Disco
   Particle.function("Set-Timezone",setTimeZone);
 
   if (!fram.begin()) {                                                  // You can stick the new i2c addr in here, e.g. begin(0x51);
-    snprintf(Status,13,"Missing FRAM");                                 // Can't communicate with FRAM - fatal error
     resetTimeStamp = millis();
     state = ERROR_STATE;
   }
   else if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) {                   // Check to see if the memory map in the sketch matches the data on the chip
-    snprintf(Status,13,"Erasing FRAM");
     ResetFRAM();                                                        // Reset the FRAM to correct the issue
     if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) {
       resetTimeStamp = millis();
@@ -181,6 +183,10 @@ void setup()                                                      // Note: Disco
 
   controlRegister = FRAMread8(CONTROLREGISTER);                         // Read the Control Register for system modes so they stick even after reset
   verboseMode = (0b00001000 & controlRegister);                         // verboseMode
+  dailyPumpingMins = FRAMread16(DAILYPUMPMINUTES);                      // Reload so we don't loose track
+  if (controlRegister & 0b00000010) {                                   // This means we reset while pumpting
+    pumpingStart = FRAMread32(CURRENTCOUNTSTIME);                       // Reload the pumping start time
+  }
 
   stateOfCharge = int(batteryMonitor.getSoC());                         // Percentage of full charge
   if (stateOfCharge > lowBattLimit) connectToParticle();                // If not low battery, we can connect
@@ -197,7 +203,14 @@ void loop()
     waitUntil(meterSampleRate);
     if(takeMeasurements()) state = REPORTING_STATE;
     lastSample = millis();
-    if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;                                    // We want to report on the hour but not after bedtime
+    if (Time.hour() != currentHourlyPeriod) {
+      state = REPORTING_STATE;                                    // We want to report on the hour
+      if (Time.hour() == 0) {                                     // Check to see if it is midnight
+        dailyPumpingMins = 0;                                     // Reset each day.
+        FRAMwrite16(DAILYPUMPMINUTES,0);                          // And zero the value in FRAM
+        Particle.syncTime();                                      // This is needed since these devices never disconnect
+      }
+    }
     if (stateOfCharge <= lowBattLimit) LOW_BATTERY_STATE;                                               // The battery is low - sleep
     break;
 
@@ -227,9 +240,12 @@ void loop()
     sendEvent();
     webhookTimeStamp = millis();
     currentHourlyPeriod = Time.hour();                // Change the time period since we have reported for this one
+    if (currentHourlyPeriod == 0) dailyPumpingMins = 0;        // Reset each day.
+    FRAMwrite16(DAILYPUMPMINUTES,0);                  // And zero the value in FRAM
     waitUntil(meterParticlePublish);
     if (verboseMode) Particle.publish("State","Waiting for Response");
     lastPublish = millis();
+    pettingEnabled = true;
     state = RESP_WAIT_STATE;                            // Wait for Response
     } break;
 
@@ -237,7 +253,6 @@ void loop()
     if (!dataInFlight)                                  // Response received
     {
       state = IDLE_STATE;
-      pettingEnabled = true;
       waitUntil(meterParticlePublish);
       if (verboseMode) Particle.publish("State","Idle");
       lastPublish = millis();
@@ -255,10 +270,10 @@ void loop()
       if (millis() - resetTimeStamp >= resetWait)
       {
         Particle.publish("State","ERROR_STATE - Resetting");
-        delay(2000);
+        delay(2000);                                          // Delay so publish can finish
         if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
         else {
-          FRAMwrite8(RESETCOUNT,0);                           // Time for a hard reset
+          FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(0));     // Zero the FRAM
           digitalWrite(hardResetPin,HIGH);                    // Zero the count so only every three
         }
       }
@@ -283,7 +298,7 @@ void resolveAlert()
 void sendEvent()
 {
   char data[256];                                         // Store the date in this character array - not global
-  snprintf(data, sizeof(data), "{\"alertValue\":%i,\"battery\":%i, \"temp\":%i, \"resets\":%i}",alertValue, stateOfCharge, temperatureF,resetCount);
+  snprintf(data, sizeof(data), "{\"alertValue\":%i, \"pumpMins\":%i, \"battery\":%i, \"temp\":%i, \"resets\":%i}",alertValue, dailyPumpingMins, stateOfCharge, temperatureF,resetCount);
   Particle.publish("Monitoring_Hourly", data, PRIVATE);
   dataInFlight = true; // set the data inflight flag
 }
@@ -292,12 +307,15 @@ void UbidotsHandler(const char *event, const char *data)  // Looks at the respon
 {
   // Response Template: "{{hourly.0.status_code}}"
   if (!data) {                                            // First check to see if there is any data
+    waitUntil(meterParticlePublish);
     Particle.publish("Ubidots Hook", "No Data");
+    lastPublish = millis();
     return;
   }
   int responseCode = atoi(data);                          // Response is only a single number thanks to Template
   if ((responseCode == 200) || (responseCode == 201))
   {
+    waitUntil(meterParticlePublish);
     if(verboseMode) Particle.publish("State","Response Received");
     lastPublish = millis();
     dataInFlight = false;                                 // Data has been received
@@ -366,20 +384,33 @@ bool notConnected() {
 
 // Take measurements
 bool takeMeasurements() {
-  bool reportFlag = false;
-  byte lastAlertValue = alertValue;                    // Last value - so we can detect a
-  alertValue = 0;                                          // Reset for each run through
-  if (Cellular.ready()) getSignalStrength();                // Test signal strength if the cellular modem is on and ready
-  getTemperature();                                         // Get Temperature at startup as well
-  stateOfCharge = int(batteryMonitor.getSoC());             // Percentage of full charge
+  controlRegister = FRAMread8(CONTROLREGISTER);                               // Check the control register
+  alertValue = 0;                                                               // Reset for each run through
+  if (Cellular.ready()) getSignalStrength();                                    // Test signal strength if the cellular modem is on and ready
+  getTemperature();                                                             // Get Temperature at startup as well
+  stateOfCharge = int(batteryMonitor.getSoC());                                 // Percentage of full charge
   if (!pinReadFast(anyOnDetectPin)) {
-    if (!pinReadFast(boosterNoFlow1Pin)) alertValue = alertValue | 0b00000001;                  // Set the value for alertValue
-    if (!pinReadFast(boosterNoFlow2Pin)) alertValue = alertValue | 0b00000010;                 // Set the value for alertValue
-    if (!pinReadFast(storageTankLowPin)) alertValue = alertValue | 0b00000100;                  // Set the value for alertValue
-    if (!pinReadFast(pump1CalledPin)) alertValue = alertValue | 0b00001000;                  // Set the value for alertValue
-    if (!pinReadFast(pump2CalledPin)) alertValue = alertValue | 0b00010000;                 // Set the value for alertValue
+    if (!pinReadFast(boosterNoFlow1Pin)) alertValue = alertValue | 0b00000001;  // Set the value for alertValue
+    if (!pinReadFast(boosterNoFlow2Pin)) alertValue = alertValue | 0b00000010;  // Set the value for alertValue
+    if (!pinReadFast(storageTankLowPin)) alertValue = alertValue | 0b00000100;  // Set the value for alertValue
+    if (!pinReadFast(pump1CalledPin)) alertValue = alertValue | 0b00001000;     // Set the value for alertValue
+    if (verboseMode) Particle.publish("State","anyOnDetectPin is low");
   }
-  if(getLostPower()) alertValue = alertValue | 0b10000000;                 // Set the value for alertValue
+  if (!pinReadFast(pump2CalledPin)) {
+    alertValue = alertValue | 0b00010000;     // Set the value for alertValue
+    if (controlRegister ^ 0b00000010) {                                        // This is a new pumping session
+      pumpingStart = Time.now();
+      FRAMwrite32(CURRENTCOUNTSTIME,pumpingStart);                              // Write to FRAM in case of a reset
+      FRAMwrite8(CONTROLREGISTER,controlRegister | 0b00000010);                 // Turn on the pumping bit
+    }
+  }
+  else if (controlRegister & 0b00000010) {                                      // If the pump is off but the pumping flag is set
+    FRAMwrite8(CONTROLREGISTER,controlRegister ^ 0b00000010);                   // It is on and I want to turn the pumping bit off with an xor
+    time_t pumpingStop = Time.now();
+    dailyPumpingMins += difftime(pumpingStop,pumpingStart)/60;                 // Add to the total for the day
+    FRAMwrite16(DAILYPUMPMINUTES,dailyPumpingMins);                             // Store it in FRAM in case of a reset
+  }
+  if(getLostPower()) alertValue = alertValue | 0b10000000;                      // Set the value for alertValue
   if (alertValue != lastAlertValue) return 1;
   else return 0;
 }
@@ -407,6 +438,8 @@ int resetCounts(String command)   // Resets the current hourly and daily counts
     FRAMwrite8(RESETCOUNT,0);          // If so, store incremented number - watchdog must have done This
     resetCount = 0;
     dataInFlight = false;
+    dailyPumpingMins = 0;
+    FRAMwrite16(DAILYPUMPMINUTES,0);
     return 1;
   }
   else return 0;
