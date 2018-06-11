@@ -43,7 +43,7 @@
 #define CURRENTCOUNTOFFSET 4          // Offsets for the values in the hourly words
 #define CURRENTDURATIONOFFSET 6       // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.58"
+#define SOFTWARERELEASENUMBER "0.61"
 
 
 // Included Libraries
@@ -107,7 +107,7 @@ time_t t;
 byte lastHour = 0;                          // For recording the startup values
 byte lastDate = 0;                          // These values make sure we record events if time has lapsed
 byte alertValue = 0;                        // Current Active Alerts
-byte lastAlertValue = 0;                    // Last value - so we can detect a
+int alertValueInt = 0;                    // Last value - so we can detect a
 bool dataInFlight = false;                  // Tracks if we have sent data but not yet cleared it from counts until we get confirmation
 byte currentHourlyPeriod;                   // This is where we will know if the period changed
 
@@ -140,7 +140,7 @@ void setup()                                                      // Note: Disco
   deviceID.toCharArray(responseTopic,125);
   Particle.subscribe(responseTopic, UbidotsHandler, MY_DEVICES);      // Subscribe to the integration response event
 
-  Particle.variable("Alerts",lastAlertValue);
+  Particle.variable("Alerts",alertValueInt);
   Particle.variable("Signal", Signal);
   Particle.variable("ResetCount", resetCount);
   Particle.variable("Temperature",temperatureF);
@@ -240,8 +240,6 @@ void loop()
     sendEvent();
     webhookTimeStamp = millis();
     currentHourlyPeriod = Time.hour();                // Change the time period since we have reported for this one
-    if (currentHourlyPeriod == 0) dailyPumpingMins = 0;        // Reset each day.
-    FRAMwrite16(DAILYPUMPMINUTES,0);                  // And zero the value in FRAM
     waitUntil(meterParticlePublish);
     if (verboseMode) Particle.publish("State","Waiting for Response");
     lastPublish = millis();
@@ -385,6 +383,8 @@ bool notConnected() {
 // Take measurements
 bool takeMeasurements() {
   controlRegister = FRAMread8(CONTROLREGISTER);                               // Check the control register
+  byte lastAlertValue = alertValue;                                             // Last value - so we can detect a
+  alertValueInt = int(alertValue);
   alertValue = 0;                                                               // Reset for each run through
   if (Cellular.ready()) getSignalStrength();                                    // Test signal strength if the cellular modem is on and ready
   getTemperature();                                                             // Get Temperature at startup as well
@@ -394,7 +394,6 @@ bool takeMeasurements() {
     if (!pinReadFast(boosterNoFlow2Pin)) alertValue = alertValue | 0b00000010;  // Set the value for alertValue
     if (!pinReadFast(storageTankLowPin)) alertValue = alertValue | 0b00000100;  // Set the value for alertValue
     if (!pinReadFast(pump1CalledPin)) alertValue = alertValue | 0b00001000;     // Set the value for alertValue
-    if (verboseMode) Particle.publish("State","anyOnDetectPin is low");
   }
   if (!pinReadFast(pump2CalledPin)) {
     alertValue = alertValue | 0b00010000;     // Set the value for alertValue
