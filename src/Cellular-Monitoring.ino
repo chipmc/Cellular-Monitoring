@@ -43,7 +43,7 @@
 #define CURRENTCOUNTOFFSET 4          // Offsets for the values in the hourly words
 #define CURRENTDURATIONOFFSET 6       // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.61"
+#define SOFTWARERELEASENUMBER "0.63"
 
 
 // Included Libraries
@@ -98,7 +98,7 @@ const char* releaseNumber = SOFTWARERELEASENUMBER;  // Displays the release on t
 byte controlRegister;                               // Stores the control register values
 int lowBattLimit = 30;                              // Trigger for Low Batt State
 bool verboseMode;                                   // Enables more active communications for configutation and setup
-retained char Signal[17];                           // Used to communicate Wireless RSSI and Description
+retained char SignalString[17];                           // Used to communicate Wireless RSSI and Description
 const char* levels[6] = {"Poor", "Low", "Medium", "Good", "Very Good", "Great"};
 bool pettingEnabled = true;
 
@@ -141,7 +141,7 @@ void setup()                                                      // Note: Disco
   Particle.subscribe(responseTopic, UbidotsHandler, MY_DEVICES);      // Subscribe to the integration response event
 
   Particle.variable("Alerts",alertValueInt);
-  Particle.variable("Signal", Signal);
+  Particle.variable("Signal", SignalString);
   Particle.variable("ResetCount", resetCount);
   Particle.variable("Temperature",temperatureF);
   Particle.variable("Release",releaseNumber);
@@ -175,6 +175,10 @@ void setup()                                                      // Note: Disco
   {
     resetCount++;
     FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(resetCount));            // If so, store incremented number - watchdog must have done This
+  }
+  if (resetCount >=6) {                                                 // If we get to resetCount 4, we are resetting without entering the main loop
+    FRAMwrite8(RESETCOUNT,4);                                            // The hope here is to get to the main loop and report a value of 4 which will indicate this issue is occuring
+    fullModemReset();                                                   // This will reset the modem and the device will reboot
   }
 
   int8_t tempTimeZoneOffset = FRAMread8(TIMEZONE);                  // Load Time zone data from FRAM
@@ -271,8 +275,8 @@ void loop()
         delay(2000);                                          // Delay so publish can finish
         if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
         else {
-          FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(0));     // Zero the FRAM
-          digitalWrite(hardResetPin,HIGH);                    // Zero the count so only every three
+          FRAMwrite8(RESETCOUNT,0);                           // Zero the ResetCount
+          fullModemReset();                                   // Full Modem reset and reboot
         }
       }
       break;
@@ -327,7 +331,7 @@ void getSignalStrength()
     CellularSignal sig = Cellular.RSSI();  // Prototype for Cellular Signal Montoring
     int rssi = sig.rssi;
     int strength = map(rssi, -131, -51, 0, 5);
-    snprintf(Signal,17, "%s: %d", levels[strength], rssi);
+    snprintf(SignalString,17, "%s: %d", levels[strength], rssi);
 }
 
 int getTemperature()
@@ -527,4 +531,19 @@ bool meterSampleRate(void)
 {
   if(millis() - lastSample >= sampleFrequency) return 1;
   else return 0;
+}
+
+void fullModemReset() {  // Adapted form Rikkas7's https://github.com/rickkas7/electronsample
+
+	Particle.disconnect(); 	                                         // Disconnect from the cloud
+	unsigned long startTime = millis();  	                           // Wait up to 15 seconds to disconnect
+	while(Particle.connected() && millis() - startTime < 15000) {
+		delay(100);
+	}
+	// Reset the modem and SIM card
+	// 16:MT silent reset (with detach from network and saving of NVM parameters), with reset of the SIM card
+	Cellular.command(30000, "AT+CFUN=16\r\n");
+	delay(1000);
+	// Go into deep sleep for 10 seconds to try to reset everything. This turns off the modem as well.
+	System.sleep(SLEEP_MODE_DEEP, 10);
 }
