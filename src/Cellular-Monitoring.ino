@@ -14,6 +14,7 @@
     The mode will be set and recoded in the CONTROLREGISTER so resets will not change the mode
     Control Register - bits 7-4, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Pumping, 0 - Low Power Mode
     We won't use Solar or Low Power modes at this time but will keep control register structure
+    v0.71 - Updated to deviceOS@2.3.0 in anticipation of switching to Electorn LTEs
 */
 
 // Easy place to change global numbers
@@ -43,7 +44,7 @@
 #define CURRENTCOUNTOFFSET 4          // Offsets for the values in the hourly words
 #define CURRENTDURATIONOFFSET 6       // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.63"
+#define SOFTWARERELEASENUMBER "0.71"
 
 
 // Included Libraries
@@ -215,7 +216,7 @@ void loop()
         Particle.syncTime();                                      // This is needed since these devices never disconnect
       }
     }
-    if (stateOfCharge <= lowBattLimit) LOW_BATTERY_STATE;                                               // The battery is low - sleep
+    if (stateOfCharge <= lowBattLimit) state = LOW_BATTERY_STATE; // The battery is low - sleep
     break;
 
   case LOW_BATTERY_STATE: {
@@ -245,7 +246,7 @@ void loop()
     webhookTimeStamp = millis();
     currentHourlyPeriod = Time.hour();                // Change the time period since we have reported for this one
     waitUntil(meterParticlePublish);
-    if (verboseMode) Particle.publish("State","Waiting for Response");
+    if (verboseMode) Particle.publish("State","Waiting for Response",PRIVATE);
     lastPublish = millis();
     pettingEnabled = true;
     state = RESP_WAIT_STATE;                            // Wait for Response
@@ -256,14 +257,14 @@ void loop()
     {
       state = IDLE_STATE;
       waitUntil(meterParticlePublish);
-      if (verboseMode) Particle.publish("State","Idle");
+      if (verboseMode) Particle.publish("State","Idle",PRIVATE);
       lastPublish = millis();
     }
     else if (millis() - webhookTimeStamp >= webhookWait) {                                         // If it takes too long - will need to reset
       resetTimeStamp = millis();
       state = ERROR_STATE;  // Response timed out
       waitUntil(meterParticlePublish);
-      Particle.publish("State","Response Timeout Error");
+      Particle.publish("State","Response Timeout Error",PRIVATE);
       lastPublish = millis();
     }
     break;
@@ -271,7 +272,7 @@ void loop()
     case ERROR_STATE:                                          // To be enhanced - where we deal with errors
       if (millis() - resetTimeStamp >= resetWait)
       {
-        Particle.publish("State","ERROR_STATE - Resetting");
+        Particle.publish("State","ERROR_STATE - Resetting",PRIVATE);
         delay(2000);                                          // Delay so publish can finish
         if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
         else {
@@ -310,7 +311,7 @@ void UbidotsHandler(const char *event, const char *data)  // Looks at the respon
   // Response Template: "{{hourly.0.status_code}}"
   if (!data) {                                            // First check to see if there is any data
     waitUntil(meterParticlePublish);
-    Particle.publish("Ubidots Hook", "No Data");
+    Particle.publish("Ubidots Hook", "No Data",PRIVATE);
     lastPublish = millis();
     return;
   }
@@ -318,20 +319,28 @@ void UbidotsHandler(const char *event, const char *data)  // Looks at the respon
   if ((responseCode == 200) || (responseCode == 201))
   {
     waitUntil(meterParticlePublish);
-    if(verboseMode) Particle.publish("State","Response Received");
+    if(verboseMode) Particle.publish("State","Response Received",PRIVATE);
     lastPublish = millis();
     dataInFlight = false;                                 // Data has been received
   }
-  else Particle.publish("Ubidots Hook", data);             // Publish the response code
+  else Particle.publish("Ubidots Hook", data, PRIVATE);             // Publish the response code
 }
 
 
-void getSignalStrength()
-{
-    CellularSignal sig = Cellular.RSSI();  // Prototype for Cellular Signal Montoring
-    int rssi = sig.rssi;
-    int strength = map(rssi, -131, -51, 0, 5);
-    snprintf(SignalString,17, "%s: %d", levels[strength], rssi);
+void getSignalStrength() {
+  const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
+  // New Signal Strength capability - https://community.particle.io/t/boron-lte-and-cellular-rssi-funny-values/45299/8
+  CellularSignal sig = Cellular.RSSI();
+
+  auto rat = sig.getAccessTechnology();
+
+  //float strengthVal = sig.getStrengthValue();
+  float strengthPercentage = sig.getStrength();
+
+  //float qualityVal = sig.getQualityValue();
+  float qualityPercentage = sig.getQuality();
+
+  snprintf(SignalString,sizeof(SignalString), "%s S:%2.0f%%, Q:%2.0f%% ", radioTech[rat], strengthPercentage, qualityPercentage);
 }
 
 int getTemperature()
@@ -477,7 +486,7 @@ int setVerboseMode(String command) // Function to force sending data in current 
     controlRegister = (0b00001000 | controlRegister);                    // Turn on verboseMode
     FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
     waitUntil(meterParticlePublish);
-    Particle.publish("Mode","Set Verbose Mode");
+    Particle.publish("Mode","Set Verbose Mode",PRIVATE);
     lastPublish = millis();
     return 1;
   }
@@ -488,7 +497,7 @@ int setVerboseMode(String command) // Function to force sending data in current 
     controlRegister = (0b11110111 & controlRegister);                    // Turn off verboseMode
     FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
     waitUntil(meterParticlePublish);
-    Particle.publish("Mode","Cleared Verbose Mode");
+    Particle.publish("Mode","Cleared Verbose Mode",PRIVATE);
     lastPublish = millis();
     return 1;
   }
@@ -506,19 +515,29 @@ int setTimeZone(String command)
   t = Time.now();
   snprintf(data, sizeof(data), "Time zone offset %i",tempTimeZoneOffset);
   waitUntil(meterParticlePublish);
-  Particle.publish("Time",data);
+  Particle.publish("Time",data, PRIVATE);
   lastPublish = millis();
   waitUntil(meterParticlePublish);
-  Particle.publish("Time",Time.timeStr(t));
+  Particle.publish("Time",Time.timeStr(t), PRIVATE);
   lastPublish = millis();
   return 1;
 }
 
 bool getLostPower() {
-	// Bit 2 (mask 0x4) == PG_STAT. If non-zero, power is good but we want to return 1 if power is lost.
-	// This means we're powered off USB or VIN, so we don't know for sure if there's a battery
-	byte systemStatus = power.getSystemStatus();
-	return ((systemStatus & 0x04) == 0);
+  // CONSTANTS
+  typedef enum {
+      POWER_SOURCE_UNKNOWN = 0,
+      POWER_SOURCE_VIN = 1,
+      POWER_SOURCE_USB_HOST = 2,
+      POWER_SOURCE_USB_ADAPTER = 3,
+      POWER_SOURCE_USB_OTG = 4,
+      POWER_SOURCE_BATTERY = 5
+  } power_source_t;
+
+  int powerSource = System.powerSource();
+
+  if (powerSource == POWER_SOURCE_VIN) return 0;        // Return false if power is good
+  else return 1;                                        // Return true otherwise 
 }
 
 bool meterParticlePublish(void)
