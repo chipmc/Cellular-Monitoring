@@ -21,6 +21,7 @@
     Control Register - bits 7-4, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Pumping, 0 - Low Power Mode
     We won't use Solar or Low Power modes at this time but will keep control register structure
     v0.71 - Updated to deviceOS@2.3.0 in anticipation of switching to Electorn LTEs
+    v0.73 - Added serial logging
 */
 
 // Easy place to change global numbers
@@ -42,12 +43,14 @@ int resetCounts(String command);
 int hardResetNow(String command);
 int sendNow(String command);
 int setVerboseMode(String command);
+int setPumpingState(String command);
 int setTimeZone(String command);
 bool getLostPower();
 bool meterParticlePublish(void);
 bool meterSampleRate(void);
 void fullModemReset();
-#line 22 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Monitoring/src/Cellular-Monitoring.ino"
+void publishStateTransition(void);
+#line 23 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Monitoring/src/Cellular-Monitoring.ino"
 #define VERSIONNUMBER 9               // Increment this number each time the memory map is changed
 #define WORDSIZE 8                    // For the Word size the number of bytes in a "word"
 #define PAGESIZE 4096                 // Memory size in bytes / word size - 256kb FRAM
@@ -73,13 +76,15 @@ void fullModemReset();
 #define CURRENTCOUNTOFFSET 4          // Offsets for the values in the hourly words
 #define CURRENTDURATIONOFFSET 6       // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.71"
+#define SOFTWARERELEASENUMBER "0.73"
 
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
 #include "FRAM-Library-Extensions.h"                     // Extends the FRAM Library
 #include "electrondoc.h"                                 // Documents pinout
+
+SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);    // This will enable user code to start executing automatically.
@@ -90,7 +95,9 @@ PMIC power;                      //Initalize the PMIC class so you can call the 
 
 // State Maching Variables
 enum State { INITIALIZATION_STATE, ERROR_STATE, IDLE_STATE, LOW_BATTERY_STATE, REPORTING_STATE, RESP_WAIT_STATE };
+char stateNames[8][14] = {"Initialize", "Error", "Idle", "Low Battery", "Reporting", "Response Wait" };
 State state = INITIALIZATION_STATE;
+State oldState = INITIALIZATION_STATE;
 
 // Pin Constants
 const int tmp36Pin =          A0;               // Simple Analog temperature sensor
@@ -119,6 +126,7 @@ unsigned long sampleTimeStamp = 0;
 unsigned long publishTimeStamp = 0;             // Keep track of when we publish a webhook
 unsigned long lastPublish = 0;
 unsigned long lastSample = 0;
+unsigned long lastConnectionCheck = 0;
 
 // Program Variables
 int temperatureF;                                   // Global variable so we can monitor via cloud variable
@@ -151,6 +159,8 @@ int dailyPumpingMins = 0;
 
 void setup()                                                      // Note: Disconnected Setup()
 {
+  delay(1000);                                                    // Give serial time to come up
+
   pinMode(boosterNoFlow1Pin,INPUT);                               // Voltage Sensor Interrupt pin
   pinMode(boosterNoFlow2Pin,INPUT);                               // Voltage Sensor Interrupt pin
   pinMode(storageTankLowPin,INPUT);                               // Voltage Sensor Interrupt pin
@@ -184,6 +194,7 @@ void setup()                                                      // Note: Disco
   Particle.function("Send-Now",sendNow);
   Particle.function("Verbose-Mode",setVerboseMode);
   Particle.function("Set-Timezone",setTimeZone);
+  Particle.function("SetPumpState",setPumpingState);
 
   if (!fram.begin()) {                                                  // You can stick the new i2c addr in here, e.g. begin(0x51);
     resetTimeStamp = millis();
@@ -228,12 +239,15 @@ void setup()                                                      // Note: Disco
   attachInterrupt(wakeUpPin, watchdogISR, RISING);   // The watchdog timer will signal us and we have to respond
 
   if (state != ERROR_STATE) state = IDLE_STATE;                         // IDLE unless error from above code
+
+  Particle.keepAlive(60);
 }
 
 void loop()
 {
   switch(state) {
   case IDLE_STATE:
+    if (state != oldState) publishStateTransition();
     waitUntil(meterSampleRate);
     if(takeMeasurements()) state = REPORTING_STATE;
     lastSample = millis();
@@ -249,6 +263,7 @@ void loop()
     break;
 
   case LOW_BATTERY_STATE: {
+      if (state != oldState) publishStateTransition();
       if (Particle.connected()) {
         disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
       }
@@ -261,8 +276,9 @@ void loop()
     } break;
 
   case REPORTING_STATE: {
+    if (state != oldState) publishStateTransition();
     watchdogISR();                                    // Pet the watchdog once an hour
-    pettingEnabled = false;                           // see this reporint cycle through
+    pettingEnabled = false;                           // see this reporort cycle through
     if (!Particle.connected()) {
       if (!connectToParticle()) {
         resetTimeStamp = millis();
@@ -282,6 +298,7 @@ void loop()
     } break;
 
   case RESP_WAIT_STATE:
+    if (state != oldState) publishStateTransition();
     if (!dataInFlight)                                  // Response received
     {
       state = IDLE_STATE;
@@ -299,6 +316,7 @@ void loop()
     break;
 
     case ERROR_STATE:                                          // To be enhanced - where we deal with errors
+      if (state != oldState) publishStateTransition();
       if (millis() - resetTimeStamp >= resetWait)
       {
         Particle.publish("State","ERROR_STATE - Resetting",PRIVATE);
@@ -311,6 +329,13 @@ void loop()
       }
       break;
   }
+
+  if (!Particle.connected() && (millis() - lastConnectionCheck > 30000)) {
+    Particle.connect();
+    lastConnectionCheck = millis();
+    Log.info("Attempting to reconnect to Particle");
+  }
+
 }
 
 void resolveAlert()
@@ -324,6 +349,7 @@ void resolveAlert()
   if (alertValue & 0b10000000) strcat(data,"Lost Power");
   waitUntil(meterParticlePublish);
   if(verboseMode) Particle.publish("Alerts",data,PRIVATE);
+  Log.info(data);
   lastPublish = millis();
 }
 
@@ -426,6 +452,10 @@ bool notConnected() {
 bool takeMeasurements() {
   controlRegister = FRAMread8(CONTROLREGISTER);                               // Check the control register
   byte lastAlertValue = alertValue;                                             // Last value - so we can detect a
+
+  if (alertValue == 16 && lastAlertValue != 16) return 1;
+  else return 0;
+  
   alertValueInt = int(alertValue);
   alertValue = 0;                                                               // Reset for each run through
   if (Cellular.ready()) getSignalStrength();                                    // Test signal strength if the cellular modem is on and ready
@@ -438,7 +468,7 @@ bool takeMeasurements() {
     if (!pinReadFast(pump1CalledPin)) alertValue = alertValue | 0b00001000;     // Set the value for alertValue
   }
   if (!pinReadFast(pump2CalledPin)) {
-    alertValue = alertValue | 0b00010000;     // Set the value for alertValue
+    alertValue = alertValue | 0b00010000;                                      // Set the value for alertValue
     if (controlRegister ^ 0b00000010) {                                        // This is a new pumping session
       pumpingStart = Time.now();
       FRAMwrite32(CURRENTCOUNTSTIME,pumpingStart);                              // Write to FRAM in case of a reset
@@ -533,6 +563,33 @@ int setVerboseMode(String command) // Function to force sending data in current 
   else return 0;
 }
 
+int setPumpingState(String command)                                     // Function to force calling the pumps
+{
+  if (command == "1")
+  {
+    alertValue = (0b00010000 | alertValue);                    // Turn on pump
+    alertValueInt = int(alertValue);
+    waitUntil(meterParticlePublish);
+    Particle.publish("Mode","Turned on Pump Called",PRIVATE);
+    Log.info("Pump called alerts = %i",alertValueInt);
+    lastPublish = millis();
+    state=REPORTING_STATE;
+    return 1;
+  }
+  else if (command == "0")
+  {
+    alertValue = (0b11101111 & alertValue);                    // Turn off pump
+    alertValueInt = (int)alertValue;
+    waitUntil(meterParticlePublish);
+    Particle.publish("Mode","Cleared Pump Called",PRIVATE);
+    Log.info("Pump cancelled alerts = %i",alertValueInt);
+    lastPublish = millis();
+    state = REPORTING_STATE;
+    return 1;
+  }
+  else return 0;
+}
+
 int setTimeZone(String command)
 {
   char * pEND;
@@ -588,10 +645,19 @@ void fullModemReset() {  // Adapted form Rikkas7's https://github.com/rickkas7/e
 	while(Particle.connected() && millis() - startTime < 15000) {
 		delay(100);
 	}
-	// Reset the modem and SIM card
-	// 16:MT silent reset (with detach from network and saving of NVM parameters), with reset of the SIM card
-	Cellular.command(30000, "AT+CFUN=16\r\n");
-	delay(1000);
-	// Go into deep sleep for 10 seconds to try to reset everything. This turns off the modem as well.
+  Cellular.off();
+  delay(10000);
 	System.sleep(SLEEP_MODE_DEEP, 10);
+}
+
+void publishStateTransition(void) {                                     // Mainly for troubleshooting - publishes the transition between states
+  char stateTransitionString[40];
+  snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s", stateNames[oldState],stateNames[state]);
+  if(Particle.connected() && verboseMode) {
+    waitUntil(meterParticlePublish);
+    Particle.publish("State Transition",stateTransitionString, PRIVATE);
+  }
+  Log.info(stateTransitionString);
+  Log.info("AlertValue = %i",alertValue);
+  oldState = state;
 }
