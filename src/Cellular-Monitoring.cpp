@@ -22,6 +22,10 @@
     We won't use Solar or Low Power modes at this time but will keep control register structure
     v0.71 - Updated to deviceOS@2.3.0 in anticipation of switching to Electorn LTEs
     v0.73 - Added serial logging
+    v0.74 - Making sure no delays in measurement
+    v0.75 - Added dagnostics and took out two lines in take measurements that was preventing readings
+    v0.76 - Moved to UbiFunctions for interpretation of Alert Values - this speeds control event execution
+    v0.77 - Updated the Webhook to eliminate test
 */
 
 // Easy place to change global numbers
@@ -50,7 +54,7 @@ bool meterParticlePublish(void);
 bool meterSampleRate(void);
 void fullModemReset();
 void publishStateTransition(void);
-#line 23 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Monitoring/src/Cellular-Monitoring.ino"
+#line 27 "/Users/chipmc/Documents/Maker/Particle/Projects/Cellular-Monitoring/src/Cellular-Monitoring.ino"
 #define VERSIONNUMBER 9               // Increment this number each time the memory map is changed
 #define WORDSIZE 8                    // For the Word size the number of bytes in a "word"
 #define PAGESIZE 4096                 // Memory size in bytes / word size - 256kb FRAM
@@ -76,7 +80,7 @@ void publishStateTransition(void);
 #define CURRENTCOUNTOFFSET 4          // Offsets for the values in the hourly words
 #define CURRENTDURATIONOFFSET 6       // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.73"
+#define SOFTWARERELEASENUMBER "0.77"
 
 
 // Included Libraries
@@ -125,7 +129,6 @@ unsigned long resetTimeStamp = 0;
 unsigned long sampleTimeStamp = 0;
 unsigned long publishTimeStamp = 0;             // Keep track of when we publish a webhook
 unsigned long lastPublish = 0;
-unsigned long lastSample = 0;
 unsigned long lastConnectionCheck = 0;
 
 // Program Variables
@@ -155,7 +158,6 @@ int stateOfCharge = 0;                      // stores battery charge level value
 // Pump monitoriing
 time_t pumpingStart = 0;
 int dailyPumpingMins = 0;
-
 
 void setup()                                                      // Note: Disconnected Setup()
 {
@@ -250,7 +252,6 @@ void loop()
     if (state != oldState) publishStateTransition();
     waitUntil(meterSampleRate);
     if(takeMeasurements()) state = REPORTING_STATE;
-    lastSample = millis();
     if (Time.hour() != currentHourlyPeriod) {
       state = REPORTING_STATE;                                    // We want to report on the hour
       if (Time.hour() == 0) {                                     // Check to see if it is midnight
@@ -451,10 +452,11 @@ bool notConnected() {
 // Take measurements
 bool takeMeasurements() {
   controlRegister = FRAMread8(CONTROLREGISTER);                               // Check the control register
-  byte lastAlertValue = alertValue;                                             // Last value - so we can detect a
+  byte lastAlertValue = alertValue;                                             // Last value - so we can detect a change
 
-  if (alertValue == 16 && lastAlertValue != 16) return 1;
-  else return 0;
+
+//  if (alertValue == 16 && lastAlertValue != 16) return 1;       // Not sure what these two lines are doing 
+//  else return 0;
   
   alertValueInt = int(alertValue);
   alertValue = 0;                                                               // Reset for each run through
@@ -481,6 +483,13 @@ bool takeMeasurements() {
     dailyPumpingMins += difftime(pumpingStop,pumpingStart)/60;                 // Add to the total for the day
     FRAMwrite16(DAILYPUMPMINUTES,dailyPumpingMins);                             // Store it in FRAM in case of a reset
   }
+
+  if (verboseMode) {
+    char messageString[256];
+    snprintf(messageString, sizeof(messageString), "Pin values: pump 1: %s, pump 2: %s",  (!pinReadFast(pump1CalledPin))? "on":"off", !pinReadFast(pump2CalledPin)? "on":"off");
+    Particle.publish("Test",messageString, PRIVATE);
+  }
+
   if(getLostPower()) alertValue = alertValue | 0b10000000;                      // Set the value for alertValue
   if (alertValue != lastAlertValue) return 1;
   else return 0;
@@ -634,7 +643,11 @@ bool meterParticlePublish(void)
 
 bool meterSampleRate(void)
 {
-  if(millis() - lastSample >= sampleFrequency) return 1;
+  static unsigned long lastSample = 0;
+  if(millis() - lastSample >= sampleFrequency) {
+    lastSample = millis();
+    return 1;
+  } 
   else return 0;
 }
 
